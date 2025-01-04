@@ -1,12 +1,12 @@
 {
-    "mode": "server",
+    "mode": "client",
     "server": {
         "listen_addr": ":5000",
         "upstream_addr": "127.0.0.1:6000",
         "heartbeat_timeout_sec": 10
     },
     "client": {
-        "listen_addr": "0.0.0.0:4000",
+        "listen_addr": "0.0.0.0:8999",
         "links": [
             {
                 "remote_addr": "1.2.3.4:5000"
@@ -16,11 +16,11 @@
             }
         ],
         "heartbeat_interval_sec": 1,
-        "loss_weight": 1.0,
-        "rtt_weight": 5.0,
-        "switch_threshold": 10.0,
-        "throughput_threshold_kbps": 1000,
-        "max_consecutive_fail": 3,
+        "loss_weight": 5.0,
+        "rtt_weight": 1.0,
+        "switch_threshold": 25.0,
+        "throughput_threshold_kbps": 500,
+        "max_consecutive_fail": 5,
         "debug": false
     }
 }

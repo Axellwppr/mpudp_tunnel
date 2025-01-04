@@ -37,10 +37,9 @@ type ClientConfig struct {
     SwitchThreshold         float64      `json:"switch_threshold"`
     ThroughputThresholdKbps float64      `json:"throughput_threshold_kbps"`
     MaxConsecutiveFail      int          `json:"max_consecutive_fail"`
-    Debug                   bool
+    Debug  bool         `json:"debug"`
 }
 
-// 每条可用线路的配置
 type LinkConfig struct {
     RemoteAddr string `json:"remote_addr"`
 }
@@ -94,25 +93,32 @@ func CalcScore(sd ScoreData, lossWeight, rttWeight float64) float64 {
 // ==================== 客户端部分 ====================
 
 type ClientLink struct {
-    RemoteAddr        *net.UDPAddr
-    ScoreHistory      []float64
-    HistoryIdx        int
-    LastScore         float64
-    ConsecutiveFail   int64  // 连续心跳收不到响应
-    testSent          int64  // 心跳/测速包已发
-    testReceived      int64  // 心跳/测速包已收到响应
+    RemoteAddr      *net.UDPAddr
+    ScoreHistory    []float64
+    HistoryIdx      int
+    LastScore       float64
+    ConsecutiveFail int64  // 连续心跳收不到响应
 
-    bytesSentInWindow int64  // 用于计算上行吞吐量
-    bytesRecvInWindow int64  // 用于计算下行吞吐量
+    testSent     int64
+    testReceived int64
+
+    // 用于统计吞吐量 (上行 + 下行)
+    bytesSentInWindow int64
+    bytesRecvInWindow int64
     windowStart       time.Time
     mu                sync.Mutex
 }
 
 type UdpClient struct {
-    config      ClientConfig
-    localConn   *net.UDPConn
+    config     ClientConfig
+    listenConn *net.UDPConn // 专门监听本地应用
+    upConn     *net.UDPConn // 专门和远端服务器通信
+
     links       []*ClientLink
-    activeIndex int64 // 原子操作，当前使用的链路下标
+    activeIndex int64 // 当前使用的线路下标(原子操作)
+
+    // 记录最近一次本地应用的地址 (只有一个客户端应用)
+    lastLocalAddr *net.UDPAddr
 
     stopChan chan struct{}
     wg       sync.WaitGroup
@@ -127,7 +133,7 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
     for _, linkCfg := range cfg.Links {
         addr, err := net.ResolveUDPAddr("udp", linkCfg.RemoteAddr)
         if err != nil {
-            return nil, fmt.Errorf("无法解析远程地址 [%s]: %v", linkCfg.RemoteAddr, err)
+            return nil, fmt.Errorf("解析远程地址 [%s] 失败: %v", linkCfg.RemoteAddr, err)
         }
         links = append(links, &ClientLink{
             RemoteAddr:   addr,
@@ -140,39 +146,46 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
         links:     links,
         stopChan:  make(chan struct{}),
     }
-
-    // 默认激活第一条线路
+    // 默认使用第 0 条线路
     atomic.StoreInt64(&client.activeIndex, 0)
     return client, nil
 }
 
 func (c *UdpClient) Start(ctx context.Context) error {
+    // 1) listenConn: 用于监听本地应用
     lAddr, err := net.ResolveUDPAddr("udp", c.config.ListenAddr)
     if err != nil {
-        return fmt.Errorf("解析客户端监听地址失败: %w", err)
+        return fmt.Errorf("解析本地监听地址失败: %w", err)
     }
-
-    c.localConn, err = net.ListenUDP("udp", lAddr)
+    c.listenConn, err = net.ListenUDP("udp", lAddr)
     if err != nil {
-        return fmt.Errorf("监听UDP失败: %w", err)
+        return fmt.Errorf("listenConn 监听失败: %w", err)
     }
-    log.Printf("[Client] 启动，监听: %s", c.config.ListenAddr)
+    log.Printf("[Client] listenConn 已监听: %s", c.config.ListenAddr)
 
-    // 初始化各线路的 windowStart
+    // 2) upConn: 用于和远端服务器通信(使用随机端口)
+    //    注意: 不指定远端, 后续通过 WriteToUDP(...) 来区分不同线路
+    c.upConn, err = net.ListenUDP("udp", nil)
+    if err != nil {
+        return fmt.Errorf("upConn 创建失败: %w", err)
+    }
+    log.Printf("[Client] upConn 本地地址: %s (系统分配端口)", c.upConn.LocalAddr())
+
+    // 初始化每条线路的 windowStart
     now := time.Now()
     for _, ln := range c.links {
         ln.windowStart = now
     }
 
-    // 启动读本地应用数据 -> 转发到远端
+    // 启动 goroutine: 读本地上层应用 -> 发往远端
     c.wg.Add(1)
-    go c.handleLocalRead()
+    go c.handleListenRead()
 
-    // 启动读远端服务器 -> 写本地
+    // 启动 goroutine: 读远端服务器 -> 回写本地
     c.wg.Add(1)
-    go c.handleServerRead()
+    go c.handleUpConnRead()
 
-    // 启动心跳/测速 例行任务
+    // 启动 goroutine: 心跳/测速例行任务
     c.wg.Add(1)
     go c.heartbeatRoutine()
 
@@ -181,24 +194,26 @@ func (c *UdpClient) Start(ctx context.Context) error {
 
 func (c *UdpClient) Stop() {
     close(c.stopChan)
-    if c.localConn != nil {
-        _ = c.localConn.Close()
+    if c.listenConn != nil {
+        _ = c.listenConn.Close()
+    }
+    if c.upConn != nil {
+        _ = c.upConn.Close()
     }
     c.wg.Wait()
 }
 
-func (c *UdpClient) handleLocalRead() {
+func (c *UdpClient) handleListenRead() {
     defer c.wg.Done()
     buf := make([]byte, 64*1024)
 
     for {
-        n, _, err := c.localConn.ReadFromUDP(buf)
+        n, srcAddr, err := c.listenConn.ReadFromUDP(buf)
         if err != nil {
             select {
             case <-c.stopChan:
                 return
             default:
-                // 区分临时错误/永久错误
                 if ne, ok := err.(net.Error); ok && ne.Temporary() {
                     log.Printf("[Client] 本地读取临时错误: %v", err)
                     continue
@@ -211,44 +226,48 @@ func (c *UdpClient) handleLocalRead() {
         data := make([]byte, n)
         copy(data, buf[:n])
 
+        // 记录本地应用地址(仅一个客户端)
+        c.lastLocalAddr = srcAddr
+
+        // 找到当前活跃线路
         idx := atomic.LoadInt64(&c.activeIndex)
         if idx < 0 || idx >= int64(len(c.links)) {
             continue
         }
         link := c.links[idx]
 
-        // 统计上行发送字节
+        // 统计上行流量
         atomic.AddInt64(&link.bytesSentInWindow, int64(n))
 
-        _, werr := c.localConn.WriteToUDP(data, link.RemoteAddr)
+        // 发往远端(使用 upConn.WriteToUDP)
+        _, werr := c.upConn.WriteToUDP(data, link.RemoteAddr)
         if werr != nil {
-            // 同理区分临时/永久
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                log.Printf("[Client] 向远程发送临时错误: %v", werr)
+                log.Printf("[Client] 向远端发送临时错误: %v", werr)
                 continue
             }
-            log.Printf("[Client] 向远程发送严重错误, goroutine 退出: %v", werr)
+            log.Printf("[Client] 向远端发送严重错误, goroutine 退出: %v", werr)
             return
         }
     }
 }
 
-func (c *UdpClient) handleServerRead() {
+func (c *UdpClient) handleUpConnRead() {
     defer c.wg.Done()
     buf := make([]byte, 64*1024)
 
     for {
-        n, addr, err := c.localConn.ReadFromUDP(buf)
+        n, remoteAddr, err := c.upConn.ReadFromUDP(buf)
         if err != nil {
             select {
             case <-c.stopChan:
                 return
             default:
                 if ne, ok := err.(net.Error); ok && ne.Temporary() {
-                    log.Printf("[Client] 服务器读取临时错误: %v", err)
+                    log.Printf("[Client] 读远端临时错误: %v", err)
                     continue
                 }
-                log.Printf("[Client] 服务器读取严重错误, goroutine 退出: %v", err)
+                log.Printf("[Client] 读远端严重错误, goroutine 退出: %v", err)
                 return
             }
         }
@@ -256,91 +275,71 @@ func (c *UdpClient) handleServerRead() {
         data := make([]byte, n)
         copy(data, buf[:n])
 
-        // 判断是否是心跳包
+        // 若是心跳响应
         if isHeartbeatPacket(data) && len(data) >= 12 {
             sendNano := bytesToInt64(data[4:12])
             rtt := time.Since(time.Unix(0, sendNano))
-            c.updateLinkTest(addr, rtt)
+
+            c.updateLinkTest(remoteAddr, rtt)
             continue
         }
 
-        // 否则是业务数据：回写本地端口
-        // 同时可统计下行流量
+        // 否则是业务数据. 判断该 remoteAddr 是否是当前活跃线路
         idx := atomic.LoadInt64(&c.activeIndex)
         if idx >= 0 && idx < int64(len(c.links)) {
             link := c.links[idx]
-            atomic.AddInt64(&link.bytesRecvInWindow, int64(n))
+
+            // 如果从当前活跃线路收来的包, 统计下行流量
+            if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
+                atomic.AddInt64(&link.bytesRecvInWindow, int64(n))
+            }
         }
 
-        // 回写到本地上层应用 (同一个UDPConn)
-        _, werr := c.localConn.WriteToUDP(data, &net.UDPAddr{
-            IP:   net.ParseIP("127.0.0.1"),
-            Port: c.localConn.LocalAddr().(*net.UDPAddr).Port,
-        })
-        if werr != nil {
-            if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                log.Printf("[Client] 回写本地临时错误: %v", werr)
-                continue
+        // 回写本地应用(若上层还没发过包, lastLocalAddr 可能是 nil)
+        if c.lastLocalAddr != nil {
+            _, werr := c.listenConn.WriteToUDP(data, c.lastLocalAddr)
+            if werr != nil {
+                if ne, ok := werr.(net.Error); ok && ne.Temporary() {
+                    log.Printf("[Client] 回写本地临时错误: %v", werr)
+                    continue
+                }
+                log.Printf("[Client] 回写本地严重错误, goroutine 退出: %v", werr)
+                return
             }
-            log.Printf("[Client] 回写本地严重错误, goroutine 退出: %v", werr)
-            return
-        }
-    }
-}
-
-func (c *UdpClient) updateLinkTest(addr *net.UDPAddr, rtt time.Duration) {
-    for _, link := range c.links {
-        if link.RemoteAddr.IP.Equal(addr.IP) && link.RemoteAddr.Port == addr.Port {
-            // 收到响应
-            atomic.AddInt64(&link.testReceived, 1)
-            // 计算丢包率
-            sent := atomic.LoadInt64(&link.testSent)
-            recv := atomic.LoadInt64(&link.testReceived)
-            var lossRate float64
-            if sent > 0 {
-                lossRate = 1 - float64(recv)/float64(sent)
-            }
-
-            score := CalcScore(ScoreData{RTT: rtt, LossRate: lossRate},
-                c.config.LossWeight, c.config.RttWeight)
-
-            link.mu.Lock()
-            link.ScoreHistory[link.HistoryIdx] = score
-            link.HistoryIdx = (link.HistoryIdx + 1) % len(link.ScoreHistory)
-            link.LastScore = score
-            link.mu.Unlock()
-
-            if c.config.Debug {
-                log.Printf("[Client] Debug: link=%s score=%.2f rtt=%v loss=%.2f",
-                    link.RemoteAddr.String(), score, rtt, lossRate)
-            }
-
-            // 成功收到 => ConsecutiveFail = 0
-            atomic.StoreInt64(&link.ConsecutiveFail, 0)
-            return
         }
     }
 }
 
+// 心跳+测速: 每隔 HeartbeatIntervalSec 发送心跳
 func (c *UdpClient) heartbeatRoutine() {
     defer c.wg.Done()
+
     interval := time.Duration(c.config.HeartbeatIntervalSec) * time.Second
     ticker := time.NewTicker(interval)
     defer ticker.Stop()
+
+    // 初始化计数器
+    tickCounter := 0
 
     for {
         select {
         case <-c.stopChan:
             return
         case <-ticker.C:
+            if c.config.Debug {
+                log.Printf("[Debug] heartbeatRoutine")
+            }
             // 1) 发心跳
             c.sendHeartbeat()
-
-            // 2) 选择最佳线路
-            c.selectBestLink()
-
-            // 3) 重置吞吐窗口
-            c.resetThroughputWindow()
+            tickCounter++
+            if tickCounter >= 10 {
+                // 2) 选最佳线路
+                c.selectBestLink()
+                // 3) 重置吞吐窗口
+                c.resetThroughputWindow()
+                // 重置计数器
+                tickCounter = 0
+            }
         }
     }
 }
@@ -349,18 +348,47 @@ func (c *UdpClient) sendHeartbeat() {
     now := time.Now().UnixNano()
     pkt := append(heartbeatMagic, int64ToBytes(now)...)
 
+    // 对每条线路都发送心跳, 即使它已标记为断线
     for _, link := range c.links {
-        // testSent +1
         atomic.AddInt64(&link.testSent, 1)
-
-        _, err := c.localConn.WriteToUDP(pkt, link.RemoteAddr)
+        _, err := c.upConn.WriteToUDP(pkt, link.RemoteAddr)
         if err != nil {
-            // 发送错误本身并不一定意味着线路断开，是否“fail”要看有没有回包
             if ne, ok := err.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Client] 心跳发送临时错误 -> %s: %v", link.RemoteAddr, err)
                 continue
             }
             log.Printf("[Client] 心跳发送严重错误 -> %s: %v", link.RemoteAddr, err)
+        }
+    }
+}
+
+func (c *UdpClient) updateLinkTest(remoteAddr *net.UDPAddr, rtt time.Duration) {
+    // 根据 remoteAddr 找到对应的 link
+    for _, link := range c.links {
+        if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
+            atomic.AddInt64(&link.testReceived, 1)
+            // 计算丢包率
+            sent := atomic.LoadInt64(&link.testSent)
+            recv := atomic.LoadInt64(&link.testReceived)
+            var loss float64
+            if sent > 0 {
+                loss = 1 - float64(recv)/float64(sent)
+            }
+
+            score := CalcScore(ScoreData{RTT: rtt, LossRate: loss},
+                c.config.LossWeight, c.config.RttWeight)
+            link.mu.Lock()
+            link.ScoreHistory[link.HistoryIdx] = score
+            link.HistoryIdx = (link.HistoryIdx + 1) % len(link.ScoreHistory)
+            link.LastScore = score
+            link.mu.Unlock()
+            if c.config.Debug {
+                log.Printf("[Debug] link=%s score=%.2f rtt=%v loss=%.2f",
+                    link.RemoteAddr.String(), score, rtt, loss)
+            }
+            // 表示本次心跳成功
+            atomic.StoreInt64(&link.ConsecutiveFail, 0)
+            return
         }
     }
 }
@@ -375,57 +403,57 @@ func (c *UdpClient) selectBestLink() {
         currLink = c.links[currIdx]
     }
 
-    // 找出分数最高的线路
+    // 找出平均分最高的 link
     for i, link := range c.links {
         fails := atomic.LoadInt64(&link.ConsecutiveFail)
         if fails >= int64(c.config.MaxConsecutiveFail) {
-            // 忽略已断开的线路
             continue
         }
         // 计算平均分
         link.mu.Lock()
         sum := 0.0
         count := 0
-        for _, s := range link.ScoreHistory {
-            if s != 0.0 {
-                sum += s
+        for _, sc := range link.ScoreHistory {
+            if sc != 0 {
+                sum += sc
                 count++
             }
         }
-        var avgScore float64
+        var avg float64
         if count > 0 {
-            avgScore = sum / float64(count)
+            avg = sum / float64(count)
         } else {
-            avgScore = link.LastScore
+            avg = link.LastScore
         }
         link.mu.Unlock()
 
-        if avgScore > bestAvgScore {
-            bestAvgScore = avgScore
+        if avg > bestAvgScore {
+            bestAvgScore = avg
             bestIdx = i
         }
     }
-
-    // 没有可用线路
+    if c.config.Debug {
+        log.Printf("[Debug] best Idx %v", bestIdx)
+    }
     if bestIdx == -1 {
+        // 所有线路都不可用
         log.Printf("[Client] 所有线路都不可用!")
         return
     }
-
-    // 若已是当前线路, 不必切换
+    // 若已是当前线路, 不切
     if int64(bestIdx) == currIdx {
         return
     }
 
-    // 若当前线路仍在用，比较分数差
+    // 若有现用线路, 看分数差是否足够
     if currLink != nil {
         // 计算当前线路平均分
         currLink.mu.Lock()
         sum := 0.0
         count := 0
-        for _, s := range currLink.ScoreHistory {
-            if s != 0.0 {
-                sum += s
+        for _, sc := range currLink.ScoreHistory {
+            if sc != 0 {
+                sum += sc
                 count++
             }
         }
@@ -437,15 +465,16 @@ func (c *UdpClient) selectBestLink() {
         }
         currLink.mu.Unlock()
 
-        diff := bestAvgScore - currAvg
-        if diff < c.config.SwitchThreshold {
-            // 分差不够, 不切
-            return
-        }
-
-        // 判断是否当前链路流量过大, 避免切换
-        if c.isCurrentLinkBusy(currLink) {
-            return
+        fails := atomic.LoadInt64(&currLink.ConsecutiveFail)
+        if fails < int64(c.config.MaxConsecutiveFail) {
+            diff := bestAvgScore - currAvg
+            if diff < c.config.SwitchThreshold {
+                return
+            }
+            // 判断是否当前线路流量过大, 不宜切换
+            if c.isCurrentLinkBusy(currLink) {
+                return
+            }
         }
     }
 
@@ -464,10 +493,10 @@ func (c *UdpClient) isCurrentLinkBusy(link *ClientLink) bool {
     if dur.Seconds() == 0 {
         return false
     }
-    // 计算上下行合并吞吐量(kbps)
+    // 计算 (上行 + 下行) 吞吐量
     kbps := float64(sent+recv) * 8.0 / 1024.0 / dur.Seconds()
     if kbps >= c.config.ThroughputThresholdKbps {
-        log.Printf("[Client] 当前线路吞吐率=%.2f Kbps, 超过阈值=%.2f, 暂不切换",
+        log.Printf("[Client] 当前线路吞吐=%.2f Kbps, 超过阈值=%.2f, 暂不切换",
             kbps, c.config.ThroughputThresholdKbps)
         return true
     }
@@ -478,13 +507,29 @@ func (c *UdpClient) resetThroughputWindow() {
     now := time.Now()
     for _, link := range c.links {
         link.mu.Lock()
-        // 重置统计窗口
         link.windowStart = now
         atomic.StoreInt64(&link.bytesSentInWindow, 0)
         atomic.StoreInt64(&link.bytesRecvInWindow, 0)
-        // 若连续无响应, 可能 fail++
-        // （本例中只在 heartbeat 未回包时自动 fail++, 可在此加更多逻辑）
+
+        // 未收到心跳时, 连续失败次数+1(粗略处理)
+        // 也可更严格: 给每个心跳包设置序号+定时器
+        sent := atomic.LoadInt64(&link.testSent)
+        // recv := atomic.LoadInt64(&link.testReceived)
+        if sent > 0 {
+            // 本轮只要 testReceived 没变化 => fail+1
+            // 但这里是简化, 真实环境下需更精细
+            failNow := atomic.AddInt64(&link.ConsecutiveFail, 1)
+            // 失败后, 依旧发心跳
+            if failNow >= int64(c.config.MaxConsecutiveFail) {
+                if c.config.Debug {
+                    log.Printf("[Debug] 线路 %s 连续无响应, 判定断开!", link.RemoteAddr)
+                }
+            }
+        }
         link.mu.Unlock()
+    }
+    if c.config.Debug {
+        log.Printf("[Debug] resetThroughputWindowDone")
     }
 }
 
@@ -498,7 +543,6 @@ type UdpServer struct {
     stopChan chan struct{}
     wg       sync.WaitGroup
 
-    // 服务端只支持单客户端，记住最后一次传输的地址
     lastDataAddr      *net.UDPAddr
     mu                sync.RWMutex
     lastHeartbeatTime time.Time
@@ -506,7 +550,7 @@ type UdpServer struct {
 
 func NewUdpServer(cfg ServerConfig) (*UdpServer, error) {
     return &UdpServer{
-        config:  cfg,
+        config:   cfg,
         stopChan: make(chan struct{}),
     }, nil
 }
@@ -527,7 +571,6 @@ func (s *UdpServer) Start(ctx context.Context) error {
     if err != nil {
         return fmt.Errorf("解析上游地址失败: %w", err)
     }
-
     s.upConn, err = net.DialUDP("udp", nil, upAddr)
     if err != nil {
         return fmt.Errorf("连接上游失败: %w", err)
@@ -585,18 +628,17 @@ func (s *UdpServer) handleClientRead() {
 
         // 如果是心跳包
         if isHeartbeatPacket(data) && len(data) >= 12 {
-            // 更新心跳时间
             s.mu.Lock()
             s.lastHeartbeatTime = time.Now()
-            s.lastDataAddr = clientAddr // 有心跳也表明这个地址在用
+            s.lastDataAddr = clientAddr
             s.mu.Unlock()
 
-            // 原样返回
+            // 原样回
             _, _ = s.listenConn.WriteToUDP(data, clientAddr)
             continue
         }
 
-        // 业务数据
+        // 否则是业务数据
         s.mu.Lock()
         s.lastDataAddr = clientAddr
         s.lastHeartbeatTime = time.Now()
@@ -605,10 +647,10 @@ func (s *UdpServer) handleClientRead() {
         _, werr := s.upConn.Write(data)
         if werr != nil {
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                log.Printf("[Server] 转发上游临时错误: %v", werr)
+                log.Printf("[Server] 向上游发送临时错误: %v", werr)
                 continue
             }
-            log.Printf("[Server] 转发上游严重错误, goroutine 退出: %v", werr)
+            log.Printf("[Server] 向上游发送严重错误, goroutine 退出: %v", werr)
             return
         }
     }
@@ -673,10 +715,9 @@ func (s *UdpServer) heartbeatTimeoutChecker() {
             s.mu.RUnlock()
 
             if time.Since(last) > timeout {
-                // 说明客户端长时间没发心跳或业务包, 清空地址
                 s.mu.Lock()
                 if s.lastDataAddr != nil {
-                    log.Printf("[Server] 心跳超时, 清理客户端地址: %v", s.lastDataAddr)
+                    log.Printf("[Server] 心跳超时，清理客户端地址: %v", s.lastDataAddr)
                 }
                 s.lastDataAddr = nil
                 s.mu.Unlock()
@@ -713,7 +754,7 @@ func main() {
         if err := srv.Start(ctx); err != nil {
             log.Fatalf("服务器启动失败: %v", err)
         }
-        log.Printf("[Server] 服务器运行中 (listen=%s, upstream=%s)",
+        log.Printf("[Server] 服务器启动完毕 (listen=%s, upstream=%s)",
             cfg.Server.ListenAddr, cfg.Server.UpstreamAddr)
         select {}
     } else if cfg.Mode == "client" {
@@ -724,7 +765,7 @@ func main() {
         if err := cli.Start(ctx); err != nil {
             log.Fatalf("客户端启动失败: %v", err)
         }
-        log.Printf("[Client] 客户端运行中 (listen=%s)", cfg.Client.ListenAddr)
+        log.Printf("[Client] 客户端启动完毕 (listen=%s)", cfg.Client.ListenAddr)
         select {}
     } else {
         log.Fatalf("无效的模式: %s (必须是 server 或 client)", cfg.Mode)
