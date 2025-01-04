@@ -37,6 +37,7 @@ type ClientConfig struct {
     SwitchThreshold         float64      `json:"switch_threshold"`
     ThroughputThresholdKbps float64      `json:"throughput_threshold_kbps"`
     MaxConsecutiveFail      int          `json:"max_consecutive_fail"`
+    DnsRefreshIntervalSec   int          `json:"dns_refresh_interval_sec"`
     Debug  bool         `json:"debug"`
 }
 
@@ -189,6 +190,9 @@ func (c *UdpClient) Start(ctx context.Context) error {
     c.wg.Add(1)
     go c.heartbeatRoutine()
 
+    c.wg.Add(1)
+    go c.startDnsRefreshRoutine()
+
     return nil
 }
 
@@ -306,6 +310,46 @@ func (c *UdpClient) handleUpConnRead() {
                 log.Printf("[Client] 回写本地严重错误, goroutine 退出: %v", werr)
                 return
             }
+        }
+    }
+}
+
+// 刷新dns缓存
+func (c *UdpClient) startDnsRefreshRoutine() {
+    defer c.wg.Done()
+
+    if c.config.DnsRefreshIntervalSec <= 0 {
+        return
+    }
+
+    interval := time.Duration(c.config.DnsRefreshIntervalSec) * time.Second
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-c.stopChan:
+            return
+        case <-ticker.C:
+            c.refreshDns()
+        }
+    }
+}
+
+func (c *UdpClient) refreshDns() {
+    for _, link := range c.links {
+        addr, err := net.ResolveUDPAddr("udp", link.RemoteAddr.String())
+        if err != nil {
+            log.Printf("[Client] 刷新 DNS 失败: %v", err)
+            continue
+        }
+
+        link.mu.Lock()
+        link.RemoteAddr = addr
+        link.mu.Unlock()
+
+        if c.config.Debug {
+            log.Printf("[Debug] DNS 刷新成功: %s -> %s", link.RemoteAddr.String(), addr.String())
         }
     }
 }
