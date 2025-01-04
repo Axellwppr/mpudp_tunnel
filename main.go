@@ -37,6 +37,7 @@ type ClientConfig struct {
     SwitchThreshold         float64      `json:"switch_threshold"`
     ThroughputThresholdKbps float64      `json:"throughput_threshold_kbps"`
     MaxConsecutiveFail      int          `json:"max_consecutive_fail"`
+    Debug                   bool
 }
 
 // 每条可用线路的配置
@@ -308,6 +309,11 @@ func (c *UdpClient) updateLinkTest(addr *net.UDPAddr, rtt time.Duration) {
             link.HistoryIdx = (link.HistoryIdx + 1) % len(link.ScoreHistory)
             link.LastScore = score
             link.mu.Unlock()
+
+            if c.config.Debug {
+                log.Printf("[Client] Debug: link=%s score=%.2f rtt=%v loss=%.2f",
+                    link.RemoteAddr.String(), score, rtt, lossRate)
+            }
 
             // 成功收到 => ConsecutiveFail = 0
             atomic.StoreInt64(&link.ConsecutiveFail, 0)

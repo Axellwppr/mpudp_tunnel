@@ -20,6 +20,7 @@
         "rtt_weight": 5.0,
         "switch_threshold": 10.0,
         "throughput_threshold_kbps": 1000,
-        "max_consecutive_fail": 3
+        "max_consecutive_fail": 3,
+        "debug": false
     }
 }
