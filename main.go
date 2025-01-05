@@ -222,8 +222,8 @@ func (c *UdpClient) handleListenRead() {
                     log.Printf("[Client] 本地读取临时错误: %v", err)
                     continue
                 }
-                log.Printf("[Client] 本地读取严重错误, goroutine 退出: %v", err)
-                return
+                log.Printf("[Client] 本地读取严重错误: %v", err)
+                os.Exit(1)
             }
         }
 
@@ -250,8 +250,8 @@ func (c *UdpClient) handleListenRead() {
                 log.Printf("[Client] 向远端发送临时错误: %v", werr)
                 continue
             }
-            log.Printf("[Client] 向远端发送严重错误, goroutine 退出: %v", werr)
-            return
+            log.Printf("[Client] 向远端发送严重错误: %v", werr)
+            os.Exit(1)
         }
     }
 }
@@ -271,8 +271,8 @@ func (c *UdpClient) handleUpConnRead() {
                     log.Printf("[Client] 读远端临时错误: %v", err)
                     continue
                 }
-                log.Printf("[Client] 读远端严重错误, goroutine 退出: %v", err)
-                return
+                log.Printf("[Client] 读远端严重错误: %v", err)
+                os.Exit(1)
             }
         }
 
@@ -307,8 +307,8 @@ func (c *UdpClient) handleUpConnRead() {
                     log.Printf("[Client] 回写本地临时错误: %v", werr)
                     continue
                 }
-                log.Printf("[Client] 回写本地严重错误, goroutine 退出: %v", werr)
-                return
+                log.Printf("[Client] 回写本地严重错误: %v", werr)
+                os.Exit(1)
             }
         }
     }
@@ -662,8 +662,8 @@ func (s *UdpServer) handleClientRead() {
                     log.Printf("[Server] 读取客户端临时错误: %v", err)
                     continue
                 }
-                log.Printf("[Server] 读取客户端严重错误, goroutine 退出: %v", err)
-                return
+                log.Printf("[Server] 读取客户端严重错误: %v", err)
+                os.Exit(1)
             }
         }
 
@@ -694,8 +694,8 @@ func (s *UdpServer) handleClientRead() {
                 log.Printf("[Server] 向上游发送临时错误: %v", werr)
                 continue
             }
-            log.Printf("[Server] 向上游发送严重错误, goroutine 退出: %v", werr)
-            return
+            log.Printf("[Server] 向上游发送严重错误: %v", werr)
+            os.Exit(1)
         }
     }
 }
@@ -715,8 +715,8 @@ func (s *UdpServer) handleUpServerRead() {
                     log.Printf("[Server] 读取上游临时错误: %v", err)
                     continue
                 }
-                log.Printf("[Server] 读取上游严重错误, goroutine 退出: %v", err)
-                return
+                log.Printf("[Server] 读取上游严重错误: %v", err)
+                os.Exit(1)
             }
         }
 
@@ -734,8 +734,8 @@ func (s *UdpServer) handleUpServerRead() {
                     log.Printf("[Server] 回写客户端临时错误: %v", werr)
                     continue
                 }
-                log.Printf("[Server] 回写客户端严重错误, goroutine 退出: %v", werr)
-                return
+                log.Printf("[Server] 回写客户端严重错误: %v", werr)
+                os.Exit(1)
             }
         }
     }
