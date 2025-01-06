@@ -12,6 +12,8 @@ import (
     "sync"
     "sync/atomic"
     "time"
+    "crypto/ed25519"
+    "encoding/base64"
 )
 
 // ==================== 配置结构 ====================
@@ -26,6 +28,9 @@ type ServerConfig struct {
     ListenAddr          string `json:"listen_addr"`
     UpstreamAddr        string `json:"upstream_addr"`
     HeartbeatTimeoutSec int    `json:"heartbeat_timeout_sec"`
+    ServerPrivateKeyBase64 string `json:"server_private_key"`
+    ClientPublicKeyBase64  string `json:"client_public_key"` 
+    MaxPacketSize         int    `json:"max_packet_size"`
 }
 
 type ClientConfig struct {
@@ -39,6 +44,9 @@ type ClientConfig struct {
     MaxConsecutiveFail      int          `json:"max_consecutive_fail"`
     DnsRefreshIntervalSec   int          `json:"dns_refresh_interval_sec"`
     Debug  bool         `json:"debug"`
+    ClientPrivateKeyBase64 string `json:"client_private_key"`
+    ServerPublicKeyBase64  string `json:"server_public_key"`
+    MaxPacketSize         int    `json:"max_packet_size"`
 }
 
 type LinkConfig struct {
@@ -77,6 +85,22 @@ func bytesToInt64(b []byte) int64 {
     return n
 }
 
+func uint64ToBytes(n uint64) []byte {
+    b := make([]byte, 8)
+    for i := 0; i < 8; i++ {
+        b[i] = byte(n >> (56 - 8*i))
+    }
+    return b
+}
+
+func bytesToUint64(b []byte) uint64 {
+    var n uint64
+    for i := 0; i < 8; i++ {
+        n = (n << 8) | uint64(b[i])
+    }
+    return n
+}
+
 type ScoreData struct {
     RTT      time.Duration
     LossRate float64 // 0~1
@@ -89,6 +113,75 @@ func CalcScore(sd ScoreData, lossWeight, rttWeight float64) float64 {
     rttMs := float64(sd.RTT.Milliseconds())
     lossPct := sd.LossRate * 100
     return -(lossWeight*lossPct + rttWeight*rttMs)
+}
+
+// 服务端解析密钥
+func parseServerKeys(cfg ServerConfig) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+    // 解码私钥
+    skBytes, err := base64.StdEncoding.DecodeString(cfg.ServerPrivateKeyBase64)
+    if err != nil {
+        return nil, nil, fmt.Errorf("解码服务器私钥失败: %v", err)
+    }
+    if len(skBytes) != ed25519.PrivateKeySize {
+        return nil, nil, fmt.Errorf("服务器私钥长度错误")
+    }
+    serverPrivateKey := ed25519.PrivateKey(skBytes)
+
+    // 解码公钥
+    pkBytes, err := base64.StdEncoding.DecodeString(cfg.ClientPublicKeyBase64)
+    if err != nil {
+        return nil, nil, fmt.Errorf("解码客户端公钥失败: %v", err)
+    }
+    if len(pkBytes) != ed25519.PublicKeySize {
+        return nil, nil, fmt.Errorf("客户端公钥长度错误") 
+    }
+    clientPublicKey := ed25519.PublicKey(pkBytes)
+
+    return serverPrivateKey, clientPublicKey, nil
+}
+
+// 客户端解析密钥
+func parseClientKeys(cfg ClientConfig) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+    // 解码私钥
+    skBytes, err := base64.StdEncoding.DecodeString(cfg.ClientPrivateKeyBase64)
+    if err != nil {
+        return nil, nil, fmt.Errorf("解码客户端私钥失败: %v", err)
+    }
+    if len(skBytes) != ed25519.PrivateKeySize {
+        return nil, nil, fmt.Errorf("客户端私钥长度错误")
+    }
+    clientPrivateKey := ed25519.PrivateKey(skBytes)
+
+    // 解码公钥
+    pkBytes, err := base64.StdEncoding.DecodeString(cfg.ServerPublicKeyBase64)
+    if err != nil {
+        return nil, nil, fmt.Errorf("解码服务器公钥失败: %v", err)
+    }
+    if len(pkBytes) != ed25519.PublicKeySize {
+        return nil, nil, fmt.Errorf("服务器公钥长度错误")
+    }
+    serverPublicKey := ed25519.PublicKey(pkBytes)
+
+    return clientPrivateKey, serverPublicKey, nil
+}
+
+// 发送数据/心跳前先签名
+func signPacket(priv ed25519.PrivateKey, data []byte) []byte {
+    sig := ed25519.Sign(priv, data)
+    return append(sig, data...)
+}
+
+// 验证签名
+func verifyPacket(pub ed25519.PublicKey, data []byte) ([]byte, bool) {
+    if len(data) < ed25519.SignatureSize {
+        return nil, false
+    }
+    sig := data[:ed25519.SignatureSize]
+    raw := data[ed25519.SignatureSize:]
+    if ed25519.Verify(pub, raw, sig) {
+        return raw, true
+    }
+    return nil, false
 }
 
 // ==================== 客户端部分 ====================
@@ -108,6 +201,9 @@ type ClientLink struct {
     bytesRecvInWindow int64
     windowStart       time.Time
     mu                sync.Mutex
+
+    nextHeartbeatID    uint64  // 下一个要发送的心跳ID
+    lastReceivedID     uint64  // 最后一个收到响应的心跳ID
 }
 
 type UdpClient struct {
@@ -123,6 +219,9 @@ type UdpClient struct {
 
     stopChan chan struct{}
     wg       sync.WaitGroup
+
+    clientPrivateKey ed25519.PrivateKey
+    serverPublicKey  ed25519.PublicKey
 }
 
 func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
@@ -137,15 +236,24 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
             return nil, fmt.Errorf("解析远程地址 [%s] 失败: %v", linkCfg.RemoteAddr, err)
         }
         links = append(links, &ClientLink{
-            RemoteAddr:   addr,
-            ScoreHistory: make([]float64, 8),
+            RemoteAddr:      addr,
+            ScoreHistory:    make([]float64, 8),
+            nextHeartbeatID: 0,
+            lastReceivedID:  ^uint64(0), // 初始化为最大值
         })
     }
 
+    clientPrivateKey, serverPublicKey, err := parseClientKeys(cfg)
+    if err != nil {
+        return nil, fmt.Errorf("解析密钥失败: %v", err)
+    }
+
     client := &UdpClient{
-        config:    cfg,
-        links:     links,
-        stopChan:  make(chan struct{}),
+        config:           cfg,
+        links:            links,
+        stopChan:         make(chan struct{}),
+        clientPrivateKey: clientPrivateKey,
+        serverPublicKey:  serverPublicKey,
     }
     // 默认使用第 0 条线路
     atomic.StoreInt64(&client.activeIndex, 0)
@@ -244,7 +352,8 @@ func (c *UdpClient) handleListenRead() {
         atomic.AddInt64(&link.bytesSentInWindow, int64(n))
 
         // 发往远端(使用 upConn.WriteToUDP)
-        _, werr := c.upConn.WriteToUDP(data, link.RemoteAddr)
+        signed := signPacket(c.clientPrivateKey, data)
+        _, werr := c.upConn.WriteToUDP(signed, link.RemoteAddr)
         if werr != nil {
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Client] 向远端发送临时错误: %v", werr)
@@ -262,6 +371,9 @@ func (c *UdpClient) handleUpConnRead() {
 
     for {
         n, remoteAddr, err := c.upConn.ReadFromUDP(buf)
+        if (n > c.config.MaxPacketSize) {
+            continue
+        }
         if err != nil {
             select {
             case <-c.stopChan:
@@ -279,12 +391,46 @@ func (c *UdpClient) handleUpConnRead() {
         data := make([]byte, n)
         copy(data, buf[:n])
 
-        // 若是心跳响应
-        if isHeartbeatPacket(data) && len(data) >= 12 {
-            sendNano := bytesToInt64(data[4:12])
-            rtt := time.Since(time.Unix(0, sendNano))
+        verifiedData, ok := verifyPacket(c.serverPublicKey, data)
+        if (!ok) {
+            // 丢弃
+            continue
+        }
 
-            c.updateLinkTest(remoteAddr, rtt)
+        // 若是心跳响应
+        if isHeartbeatPacket(verifiedData) && len(verifiedData) >= 20 { // 4+8+8=20
+            sendNano := bytesToInt64(verifiedData[4:12])
+            heartbeatID := bytesToUint64(verifiedData[12:20])
+            
+            // 检查时间戳,如果超过2秒就丢弃
+            if time.Since(time.Unix(0, sendNano)) > 2*time.Second {
+                if c.config.Debug {
+                    log.Printf("[Debug] 丢弃过期心跳包")
+                }
+                continue
+            }
+
+            // 找到对应的link并验证心跳ID
+            for _, link := range c.links {
+                if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
+                    link.mu.Lock()
+                    // 检查ID是否是最新的
+                    if heartbeatID <= link.lastReceivedID {
+                        link.mu.Unlock()
+                        if c.config.Debug {
+                            log.Printf("[Debug] 丢弃过期心跳ID: received=%d, last=%d", 
+                                heartbeatID, link.lastReceivedID)
+                        }
+                        continue
+                    }
+                    link.lastReceivedID = heartbeatID
+                    link.mu.Unlock()
+
+                    rtt := time.Since(time.Unix(0, sendNano))
+                    c.updateLinkTest(remoteAddr, rtt)
+                    break
+                }
+            }
             continue
         }
 
@@ -301,7 +447,7 @@ func (c *UdpClient) handleUpConnRead() {
 
         // 回写本地应用(若上层还没发过包, lastLocalAddr 可能是 nil)
         if c.lastLocalAddr != nil {
-            _, werr := c.listenConn.WriteToUDP(data, c.lastLocalAddr)
+            _, werr := c.listenConn.WriteToUDP(verifiedData, c.lastLocalAddr)
             if werr != nil {
                 if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                     log.Printf("[Client] 回写本地临时错误: %v", werr)
@@ -390,12 +536,19 @@ func (c *UdpClient) heartbeatRoutine() {
 
 func (c *UdpClient) sendHeartbeat() {
     now := time.Now().UnixNano()
-    pkt := append(heartbeatMagic, int64ToBytes(now)...)
 
     // 对每条线路都发送心跳, 即使它已标记为断线
     for _, link := range c.links {
+        link.mu.Lock()
+        // 构造心跳包: magic(4) + timestamp(8) + heartbeatID(8)
+        id := atomic.AddUint64(&link.nextHeartbeatID, 1) - 1
+        pkt := append(heartbeatMagic, int64ToBytes(now)...)
+        pkt = append(pkt, uint64ToBytes(id)...)
+        link.mu.Unlock()
+
+        signedPkt := signPacket(c.clientPrivateKey, pkt)
         atomic.AddInt64(&link.testSent, 1)
-        _, err := c.upConn.WriteToUDP(pkt, link.RemoteAddr)
+        _, err := c.upConn.WriteToUDP(signedPkt, link.RemoteAddr)
         if err != nil {
             if ne, ok := err.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Client] 心跳发送临时错误 -> %s: %v", link.RemoteAddr, err)
@@ -590,12 +743,22 @@ type UdpServer struct {
     lastDataAddr      *net.UDPAddr
     mu                sync.RWMutex
     lastHeartbeatTime time.Time
+
+    serverPrivateKey ed25519.PrivateKey
+    clientPublicKey  ed25519.PublicKey
 }
 
 func NewUdpServer(cfg ServerConfig) (*UdpServer, error) {
+    serverPrivateKey, clientPublicKey, err := parseServerKeys(cfg)
+    if err != nil {
+        return nil, fmt.Errorf("解析密钥失败: %v", err)
+    }
+
     return &UdpServer{
-        config:   cfg,
-        stopChan: make(chan struct{}),
+        config:           cfg,
+        stopChan:         make(chan struct{}),
+        serverPrivateKey: serverPrivateKey,
+        clientPublicKey:  clientPublicKey,
     }, nil
 }
 
@@ -653,6 +816,11 @@ func (s *UdpServer) handleClientRead() {
     buf := make([]byte, 64*1024)
     for {
         n, clientAddr, err := s.listenConn.ReadFromUDP(buf)
+
+        if n > s.config.MaxPacketSize {
+            continue
+        }
+
         if err != nil {
             select {
             case <-s.stopChan:
@@ -670,15 +838,22 @@ func (s *UdpServer) handleClientRead() {
         data := make([]byte, n)
         copy(data, buf[:n])
 
+        verifiedData, ok := verifyPacket(s.clientPublicKey, data)
+        if !ok {
+            // 丢弃
+            continue
+        }
+
         // 如果是心跳包
-        if isHeartbeatPacket(data) && len(data) >= 12 {
+        if isHeartbeatPacket(verifiedData) && len(verifiedData) >= 12 {
             s.mu.Lock()
             s.lastHeartbeatTime = time.Now()
             s.lastDataAddr = clientAddr
             s.mu.Unlock()
 
             // 原样回
-            _, _ = s.listenConn.WriteToUDP(data, clientAddr)
+            signed := signPacket(s.serverPrivateKey, verifiedData)
+            _, _ = s.listenConn.WriteToUDP(signed, clientAddr)
             continue
         }
 
@@ -688,7 +863,7 @@ func (s *UdpServer) handleClientRead() {
         s.lastHeartbeatTime = time.Now()
         s.mu.Unlock()
 
-        _, werr := s.upConn.Write(data)
+        _, werr := s.upConn.Write(verifiedData)
         if werr != nil {
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Server] 向上游发送临时错误: %v", werr)
@@ -728,7 +903,8 @@ func (s *UdpServer) handleUpServerRead() {
         s.mu.RUnlock()
 
         if addr != nil {
-            _, werr := s.listenConn.WriteToUDP(data, addr)
+            signed := signPacket(s.serverPrivateKey, data)
+            _, werr := s.listenConn.WriteToUDP(signed, addr)
             if werr != nil {
                 if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                     log.Printf("[Server] 回写客户端临时错误: %v", werr)

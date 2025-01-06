@@ -3,10 +3,16 @@
     "server": {
         "listen_addr": ":5000",
         "upstream_addr": "127.0.0.1:6000",
-        "heartbeat_timeout_sec": 10
+        "heartbeat_timeout_sec": 10,
+        "server_private_key": "BASE64_SERVER_SK",
+        "client_public_key": "BASE64_CLIENT_PK",
+        "max_packet_size": 2000
     },
     "client": {
         "listen_addr": "0.0.0.0:8999",
+        "client_private_key": "BASE64_CLIENT_SK",
+        "server_public_key": "BASE64_SERVER_PK",
+        "max_packet_size": 2000,
         "links": [
             {
                 "remote_addr": "1.2.3.4:5000"
