@@ -238,8 +238,8 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
         links = append(links, &ClientLink{
             RemoteAddr:      addr,
             ScoreHistory:    make([]float64, 8),
-            nextHeartbeatID: 0,
-            lastReceivedID:  ^uint64(0), // 初始化为最大值
+            nextHeartbeatID: 1,
+            lastReceivedID:  0,
         })
     }
 
