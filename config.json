@@ -21,7 +21,7 @@
                 "remote_addr": "[240c::1]:5000"
             }
         ],
-        "heartbeat_interval_sec": 1,
+        "heartbeat_interval_sec": 0.5,
         "loss_weight": 5.0,
         "rtt_weight": 1.0,
         "switch_threshold": 25.0,

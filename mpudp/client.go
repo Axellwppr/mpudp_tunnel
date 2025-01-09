@@ -435,18 +435,19 @@ func (c *UdpClient) selectBestLink() {
     // 找出平均分最高的 link
     for i, link := range c.links {
         fails := atomic.LoadInt64(&link.ConsecutiveFail)
-        if fails >= int64(c.config.MaxConsecutiveFail) {
-            if c.config.Debug {
-                log.Printf("[Debug] %d 连续失败次数过多: %d", i, fails)
-            }
-            continue
-        }
 
         sent := atomic.SwapInt64(&link.testSent, 0)
         lost := atomic.SwapInt64(&link.testLost, 0)
 
         rttSum := atomic.SwapInt64(&link.accRTT, 0)
         rttCount := atomic.SwapInt64(&link.rttCount, 0)
+
+        if fails >= int64(c.config.MaxConsecutiveFail) {
+            if c.config.Debug {
+                log.Printf("[Debug] %d 连续失败次数过多: %d", i, fails)
+            }
+            continue
+        }
 
         // 计算丢包率
         if sent == 0 {

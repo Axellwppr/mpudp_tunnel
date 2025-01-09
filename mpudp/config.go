@@ -18,7 +18,7 @@ type ServerConfig struct {
 type ClientConfig struct {
     ListenAddr              string       `json:"listen_addr"`
     Links                   []LinkConfig `json:"links"`
-    HeartbeatIntervalSec    int          `json:"heartbeat_interval_sec"`
+    HeartbeatIntervalSec    float64      `json:"heartbeat_interval_sec"`
     LossWeight              float64      `json:"loss_weight"`
     RttWeight               float64      `json:"rtt_weight"`
     SwitchThreshold         float64      `json:"switch_threshold"`
