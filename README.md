@@ -112,7 +112,12 @@ The service requires a JSON configuration file. The default configuration file i
 1. Start the service with the appropriate mode:  
    使用对应模式启动服务：
    ```bash
-   ./udp-relay -config=config.json
+   cd mpudp
+   go build -o mpudp
+   ./mpudp -config=config.json
+
+   cd keygen
+   go build -o keygen
    ```
 
 2. The server listens for client connections and relays data to the upstream server.  
