@@ -436,6 +436,9 @@ func (c *UdpClient) selectBestLink() {
     for i, link := range c.links {
         fails := atomic.LoadInt64(&link.ConsecutiveFail)
         if fails >= int64(c.config.MaxConsecutiveFail) {
+            if c.config.Debug {
+                log.Printf("[Debug] %d 连续失败次数过多: %d", i, fails)
+            }
             continue
         }
 
@@ -460,7 +463,6 @@ func (c *UdpClient) selectBestLink() {
         // 根据 rtt 和 loss 算分
         score := CalcScore(ScoreData{RTT: rtt, LossRate: loss}, c.config.LossWeight, c.config.RttWeight)
 
-
         if score > bestScore {
             bestScore = score
             bestIdx = i
@@ -468,6 +470,10 @@ func (c *UdpClient) selectBestLink() {
 
         if int64(i) == currIdx {
             currScore = score
+        }
+
+        if c.config.Debug {
+            log.Printf("[Debug] %d: sent=%d, lost=%d, loss=%.2f, rtt=%.2f, score=%.2f", i, sent, lost, loss, rtt, score)
         }
     }
     if c.config.Debug {
