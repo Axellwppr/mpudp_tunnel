@@ -349,7 +349,7 @@ func (c *UdpClient) refreshDns() {
 func (c *UdpClient) heartbeatRoutine() {
     defer c.wg.Done()
 
-    interval := time.Duration(c.config.HeartbeatIntervalSec) * time.Second
+    interval := time.Duration(int64(c.config.HeartbeatIntervalSec * 1000)) * time.Millisecond
     ticker := time.NewTicker(interval)
     defer ticker.Stop()
 
