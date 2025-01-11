@@ -32,5 +32,6 @@ type ClientConfig struct {
 }
 
 type LinkConfig struct {
-    RemoteAddr string `json:"remote_addr"`
+    RemoteAddr string  `json:"remote_addr"`
+    Priority   float64 `json:"priority"` // 优先级，数值越大优先级越低
 }

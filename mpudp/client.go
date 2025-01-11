@@ -15,6 +15,7 @@ import (
 
 type ClientLink struct {
     RemoteAddr      *net.UDPAddr
+    Priority        float64
     ConsecutiveFail int64
 
     // 心跳测速用
@@ -67,6 +68,7 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
         }
         links = append(links, &ClientLink{
             RemoteAddr:         addr,
+            Priority:          linkCfg.Priority,
             nextHeartbeatID:    1,
             heartbeatSentTimes: make(map[uint64]time.Time), // 新增
         })
@@ -461,8 +463,8 @@ func (c *UdpClient) selectBestLink() {
         }
         rtt := float64(rttSum) / float64(rttCount)
 
-        // 根据 rtt 和 loss 算分
-        score := CalcScore(ScoreData{RTT: rtt, LossRate: loss}, c.config.LossWeight, c.config.RttWeight)
+        // 根据 rtt 和 loss 算分，并减去优先级值
+        score := CalcScore(ScoreData{RTT: rtt, LossRate: loss}, c.config.LossWeight, c.config.RttWeight) - link.Priority
 
         if score > bestScore {
             bestScore = score

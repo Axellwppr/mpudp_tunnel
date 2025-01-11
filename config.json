@@ -15,10 +15,12 @@
         "max_packet_size": 2000,
         "links": [
             {
-                "remote_addr": "1.2.3.4:5000"
+                "remote_addr": "1.2.3.4:5000",
+                "priority": 0.0
             },
             {
-                "remote_addr": "[240c::1]:5000"
+                "remote_addr": "[240c::1]:5000",
+                "priority": 100.0
             }
         ],
         "heartbeat_interval_sec": 0.5,
