@@ -10,7 +10,7 @@ import (
     "sync"
     "sync/atomic"
     "time"
-    "crypto/ed25519"
+    "github.com/cloudflare/circl/sign/ed25519"
 )
 
 type ClientLink struct {

@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"crypto/ed25519"
+	"github.com/cloudflare/circl/sign/ed25519"
 )
 
 func main() {

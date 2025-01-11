@@ -1,7 +1,7 @@
 package main
 
 import (
-    "crypto/ed25519"
+    "github.com/cloudflare/circl/sign/ed25519"
     "encoding/base64"
     "fmt"
 )

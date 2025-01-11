@@ -8,7 +8,7 @@ import (
     "os"
     "sync"
     "time"
-    "crypto/ed25519"
+    "github.com/cloudflare/circl/sign/ed25519"
 )
 
 
