@@ -124,7 +124,7 @@ func (s *UdpServer) handleClientRead() {
             }
 
             // 如果该心跳包为激活包，则更新客户端地址
-            if verifiedData[21] == activeMagic[0] {
+            if verifiedData[20] == activeMagic[0] {
                 s.mu.Lock()
                 s.lastHeartbeatTime = time.Now()
                 s.lastDataAddr = clientAddr
