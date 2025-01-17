@@ -115,42 +115,36 @@ func (s *UdpServer) handleClientRead() {
             }
         }
 
-        data := make([]byte, n)
-        copy(data, buf[:n])
-
-        verifiedData, ok := verifyPacket(s.clientPublicKey, data)
-        if !ok {
-            // 丢弃
-            continue
-        }
-
-        // 如果是心跳包
-        if isHeartbeatPacket(verifiedData) && len(verifiedData) >= 12 {
-            s.mu.Lock()
-            s.lastHeartbeatTime = time.Now()
-            s.lastDataAddr = clientAddr
-            s.mu.Unlock()
-
-            // 原样回
-            signed := signPacket(s.serverPrivateKey, verifiedData)
-            _, _ = s.listenConn.WriteToUDP(signed, clientAddr)
-            continue
-        }
-
-        // 否则是业务数据
-        s.mu.Lock()
-        s.lastDataAddr = clientAddr
-        s.lastHeartbeatTime = time.Now()
-        s.mu.Unlock()
-
-        _, werr := s.upConn.Write(verifiedData)
-        if werr != nil {
-            if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                log.Printf("[Server] 向上游发送临时错误: %v", werr)
+        if isHeartbeatPacket(buf[:n]){
+            // 仅对心跳包进行验签
+            verifiedData, ok := verifyPacket(s.clientPublicKey, buf[:n])
+            if !ok {
+                // 验签不通过，丢弃
                 continue
             }
-            log.Printf("[Server] 向上游发送严重错误: %v", werr)
-            os.Exit(1)
+
+            // 如果该心跳包为激活包，则更新客户端地址
+            if verifiedData[21] == activeMagic[0] {
+                s.mu.Lock()
+                s.lastHeartbeatTime = time.Now()
+                s.lastDataAddr = clientAddr
+                s.mu.Unlock()
+            }
+
+            // 回签名
+            signed := signPacket(s.serverPrivateKey, verifiedData)
+            _, _ = s.listenConn.WriteToUDP(signed, clientAddr)
+        } else {
+            // 直接把原始数据写给上游，不做签名
+            _, werr := s.upConn.Write(buf[:n])
+            if werr != nil {
+                if ne, ok := werr.(net.Error); ok && ne.Temporary() {
+                    log.Printf("[Server] 向上游发送临时错误: %v", werr)
+                    continue
+                }
+                log.Printf("[Server] 向上游发送严重错误: %v", werr)
+                os.Exit(1)
+            }
         }
     }
 }
@@ -175,16 +169,12 @@ func (s *UdpServer) handleUpServerRead() {
             }
         }
 
-        data := make([]byte, n)
-        copy(data, buf[:n])
-
         s.mu.RLock()
         addr := s.lastDataAddr
         s.mu.RUnlock()
 
         if addr != nil {
-            signed := signPacket(s.serverPrivateKey, data)
-            _, werr := s.listenConn.WriteToUDP(signed, addr)
+            _, werr := s.listenConn.WriteToUDP(buf[:n], addr)
             if werr != nil {
                 if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                     log.Printf("[Server] 回写客户端临时错误: %v", werr)

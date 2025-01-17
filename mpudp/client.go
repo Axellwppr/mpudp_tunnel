@@ -30,7 +30,7 @@ type ClientLink struct {
     bytesSentInWindow int64
     bytesRecvInWindow int64
     windowStart       time.Time
-    mu                sync.Mutex
+    mu                sync.RWMutex
 
     nextHeartbeatID    uint64
     heartbeatSentTimes map[uint64]time.Time
@@ -163,11 +163,10 @@ func (c *UdpClient) handleListenRead() {
             }
         }
 
-        data := make([]byte, n)
-        copy(data, buf[:n])
-
         // 记录本地应用地址(仅一个客户端)
-        c.lastLocalAddr = srcAddr
+        if c.lastLocalAddr == nil {
+            c.lastLocalAddr = srcAddr
+        }
 
         // 找到当前活跃线路
         idx := atomic.LoadInt64(&c.activeIndex)
@@ -180,8 +179,7 @@ func (c *UdpClient) handleListenRead() {
         atomic.AddInt64(&link.bytesSentInWindow, int64(n))
 
         // 发往远端(使用 upConn.WriteToUDP)
-        signed := signPacket(c.clientPrivateKey, data)
-        _, werr := c.upConn.WriteToUDP(signed, link.RemoteAddr)
+        _, werr := c.upConn.WriteToUDP(buf[:n], link.RemoteAddr)
         if werr != nil {
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Client] 向远端发送临时错误: %v", werr)
@@ -216,17 +214,13 @@ func (c *UdpClient) handleUpConnRead() {
             }
         }
 
-        data := make([]byte, n)
-        copy(data, buf[:n])
-
-        verifiedData, ok := verifyPacket(c.serverPublicKey, data)
-        if (!ok) {
-            // 丢弃
-            continue
-        }
-
         // 若是心跳响应
-        if isHeartbeatPacket(verifiedData) && len(verifiedData) >= 20 { // 4+8+8=20
+        if isHeartbeatPacket(buf[:n]) {
+            verifiedData, ok := verifyPacket(c.serverPublicKey, buf[:n])
+            if !ok {
+                // 验签不通过，丢弃
+                continue
+            }
             sendNano := bytesToInt64(verifiedData[4:12])
             heartbeatID := bytesToUint64(verifiedData[12:20])
             
@@ -239,30 +233,28 @@ func (c *UdpClient) handleUpConnRead() {
             }
 
             c.updateLinkTest(remoteAddr, heartbeatID, sendNano)
-            continue
-        }
-
-        // 否则是业务数据. 判断该 remoteAddr 是否是当前活跃线路
-        idx := atomic.LoadInt64(&c.activeIndex)
-        if idx >= 0 && idx < int64(len(c.links)) {
-            link := c.links[idx]
-
-            // 如果从当前活跃线路收来的包, 统计下行流量
-            if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
-                atomic.AddInt64(&link.bytesRecvInWindow, int64(n))
-            }
-        }
-
-        // 回写本地应用(若上层还没发过包, lastLocalAddr 可能是 nil)
-        if c.lastLocalAddr != nil {
-            _, werr := c.listenConn.WriteToUDP(verifiedData, c.lastLocalAddr)
-            if werr != nil {
-                if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                    log.Printf("[Client] 回写本地临时错误: %v", werr)
-                    continue
+        }else{
+            // 否则是业务数据. 判断该 remoteAddr 是否是当前活跃线路
+            idx := atomic.LoadInt64(&c.activeIndex)
+            if idx >= 0 && idx < int64(len(c.links)) {
+                link := c.links[idx]
+                // 如果从当前活跃线路收来的包, 统计下行流量
+                if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
+                    atomic.AddInt64(&link.bytesRecvInWindow, int64(n))
                 }
-                log.Printf("[Client] 回写本地严重错误: %v", werr)
-                os.Exit(1)
+            }
+
+            // 回写本地应用(若上层还没发过包, lastLocalAddr 可能是 nil)
+            if c.lastLocalAddr != nil {
+                _, werr := c.listenConn.WriteToUDP(buf[:n], c.lastLocalAddr)
+                if werr != nil {
+                    if ne, ok := werr.(net.Error); ok && ne.Temporary() {
+                        log.Printf("[Client] 回写本地临时错误: %v", werr)
+                        continue
+                    }
+                    log.Printf("[Client] 回写本地严重错误: %v", werr)
+                    os.Exit(1)
+                }
             }
         }
     }
@@ -386,13 +378,19 @@ func (c *UdpClient) sendHeartbeat() {
     now := time.Now()
 
     // 对每条线路都发送心跳, 即使它已标记为断线
-    for _, link := range c.links {
+    for linkID, link := range c.links {
         link.mu.Lock()
         id := atomic.AddUint64(&link.nextHeartbeatID, 1) - 1
         link.heartbeatSentTimes[id] = now
         link.mu.Unlock()
         pkt := append(heartbeatMagic, int64ToBytes(now.UnixNano())...)
         pkt = append(pkt, uint64ToBytes(id)...)
+
+        if int64(linkID) == atomic.LoadInt64(&c.activeIndex) {
+            pkt = append(pkt, activeMagic...)
+        } else {
+            pkt = append(pkt, nonActiveMagic...)
+        }
 
         signedPkt := signPacket(c.clientPrivateKey, pkt)
         atomic.AddInt64(&link.testSent, 1)
@@ -508,11 +506,11 @@ func (c *UdpClient) selectBestLink() {
 }
 
 func (c *UdpClient) isCurrentLinkBusy(link *ClientLink) bool {
-    link.mu.Lock()
+    link.mu.RLock()
     sent := atomic.LoadInt64(&link.bytesSentInWindow)
     recv := atomic.LoadInt64(&link.bytesRecvInWindow)
     dur := time.Since(link.windowStart)
-    link.mu.Unlock()
+    link.mu.RUnlock()
 
     if dur.Seconds() == 0 {
         return false

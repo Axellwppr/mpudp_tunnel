@@ -8,12 +8,15 @@ import (
 
 var heartbeatMagic = []byte{0xFF, 0x00, 0xFF, 0x00}
 
+var nonActiveMagic = []byte{0x00}
+var activeMagic = []byte{0xFF}
+
 func isHeartbeatPacket(data []byte) bool {
-    if len(data) < 4 {
+    if len(data) != ed25519.SignatureSize + 21 {
         return false
     }
     for i := 0; i < 4; i++ {
-        if data[i] != heartbeatMagic[i] {
+        if data[ed25519.SignatureSize + i] != heartbeatMagic[i] {
             return false
         }
     }
