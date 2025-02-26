@@ -28,7 +28,8 @@ type ClientConfig struct {
     Debug                   bool          `json:"debug"`
     ClientPrivateKeyBase64  string       `json:"client_private_key"`
     ServerPublicKeyBase64   string       `json:"server_public_key"`
-    MaxPacketSize          int          `json:"max_packet_size"`
+    MaxPacketSize           int          `json:"max_packet_size"`
+    ScoreFile               string       `json:"score_file"`
 }
 
 type LinkConfig struct {

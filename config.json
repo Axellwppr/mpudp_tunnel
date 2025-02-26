@@ -30,6 +30,7 @@
         "throughput_threshold_kbps": 500,
         "max_consecutive_fail": 5,
         "dns_refresh_interval_sec": 600,
-        "debug": false
+        "debug": false,
+        "score_file": "/etc/mpudp/score.log"
     }
 }

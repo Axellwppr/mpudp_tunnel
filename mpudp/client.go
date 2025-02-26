@@ -424,13 +424,15 @@ func (c *UdpClient) checkHeartbeatTimeout() {
         link.mu.Unlock()
     }
 }
-
 func (c *UdpClient) selectBestLink() {
     bestIdx := -1
     bestScore := -math.MaxFloat64
 
     currIdx := atomic.LoadInt64(&c.activeIndex)
     currScore := -math.MaxFloat64
+
+    // 累计所有链路的调试数据
+    var debugData string
 
     // 找出平均分最高的 link
     for i, link := range c.links {
@@ -474,9 +476,19 @@ func (c *UdpClient) selectBestLink() {
         }
 
         if c.config.Debug {
-            log.Printf("[Debug] %d: sent=%d, lost=%d, loss=%.2f, rtt=%.2f, score=%.2f", i, sent, lost, loss, rtt, score)
+            line := fmt.Sprintf("[Debug] %d: sent=%d, lost=%d, loss=%.2f, rtt=%.2f, score=%.2f\n", i, sent, lost, loss, rtt, score)
+            log.Printf("%s", line)
+            debugData += line
         }
     }
+
+    // 新增：将所有链路的调试数据写入 ScoreFile（只保留最近一次数据）
+    if c.config.ScoreFile != "" {
+        if err := os.WriteFile(c.config.ScoreFile, []byte(debugData), 0644); err != nil {
+            log.Printf("[Debug] 写入分数文件错误: %v", err)
+        }
+    }
+
     if c.config.Debug {
         log.Printf("[Debug] best Idx %v", bestIdx)
     }
