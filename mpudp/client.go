@@ -475,10 +475,11 @@ func (c *UdpClient) selectBestLink() {
             currScore = score
         }
 
+        line := fmt.Sprintf("[Debug] %d: sent=%d, lost=%d, loss=%.2f, rtt=%.2f, score=%.2f\n", i, sent, lost, loss, rtt, score)
+        debugData += line
+        
         if c.config.Debug {
-            line := fmt.Sprintf("[Debug] %d: sent=%d, lost=%d, loss=%.2f, rtt=%.2f, score=%.2f\n", i, sent, lost, loss, rtt, score)
             log.Printf("%s", line)
-            debugData += line
         }
     }
 
