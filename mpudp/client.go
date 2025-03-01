@@ -14,7 +14,8 @@ import (
 )
 
 type ClientLink struct {
-    RemoteAddr      *net.UDPAddr
+    OriginalAddr string
+    remoteAddr atomic.Value
     Priority        float64
     ConsecutiveFail int64
 
@@ -44,6 +45,7 @@ type UdpClient struct {
 
     links       []*ClientLink
     activeIndex int64 // 当前使用的线路下标(原子操作)
+    activeAddr atomic.Value // 将存储 *net.UDPAddr
 
     // 记录最近一次本地应用的地址 (只有一个客户端应用)
     lastLocalAddr *net.UDPAddr
@@ -53,6 +55,8 @@ type UdpClient struct {
 
     clientPrivateKey ed25519.PrivateKey
     serverPublicKey  ed25519.PublicKey
+
+    mu_critical      sync.Mutex
 }
 
 func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
@@ -66,12 +70,15 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
         if err != nil {
             return nil, fmt.Errorf("解析远程地址 [%s] 失败: %v", linkCfg.RemoteAddr, err)
         }
-        links = append(links, &ClientLink{
-            RemoteAddr:         addr,
+        link := &ClientLink{
+            OriginalAddr:      linkCfg.RemoteAddr,
             Priority:          linkCfg.Priority,
-            nextHeartbeatID:    1,
-            heartbeatSentTimes: make(map[uint64]time.Time), // 新增
-        })
+            nextHeartbeatID:   1,
+            heartbeatSentTimes: make(map[uint64]time.Time),
+        }
+        // 使用 atomic.Store 将解析后的地址存入
+        link.remoteAddr.Store(addr)
+        links = append(links, link)
     }
 
     clientPrivateKey, serverPublicKey, err := parseClientKeys(cfg)
@@ -88,6 +95,7 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
     }
     // 默认使用第 0 条线路
     atomic.StoreInt64(&client.activeIndex, 0)
+    client.activeAddr.Store(links[0].remoteAddr.Load().(*net.UDPAddr))
     return client, nil
 }
 
@@ -168,18 +176,10 @@ func (c *UdpClient) handleListenRead() {
             c.lastLocalAddr = srcAddr
         }
 
-        // 找到当前活跃线路
-        idx := atomic.LoadInt64(&c.activeIndex)
-        if idx < 0 || idx >= int64(len(c.links)) {
-            continue
-        }
-        link := c.links[idx]
-
-        // 统计上行流量
-        atomic.AddInt64(&link.bytesSentInWindow, int64(n))
+        activeAddr := c.activeAddr.Load().(*net.UDPAddr)
 
         // 发往远端(使用 upConn.WriteToUDP)
-        _, werr := c.upConn.WriteToUDP(buf[:n], link.RemoteAddr)
+        _, werr := c.upConn.WriteToUDP(buf[:n], activeAddr)
         if werr != nil {
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Client] 向远端发送临时错误: %v", werr)
@@ -234,12 +234,12 @@ func (c *UdpClient) handleUpConnRead() {
 
             c.updateLinkTest(remoteAddr, heartbeatID, sendNano)
         }else{
-            // 否则是业务数据. 判断该 remoteAddr 是否是当前活跃线路
-            idx := atomic.LoadInt64(&c.activeIndex)
-            if idx >= 0 && idx < int64(len(c.links)) {
-                link := c.links[idx]
-                // 如果从当前活跃线路收来的包, 统计下行流量
-                if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
+            activeAddr := c.activeAddr.Load().(*net.UDPAddr)
+            if activeAddr.IP.Equal(remoteAddr.IP) && activeAddr.Port == remoteAddr.Port {
+                // 统计下行流量
+                idx := atomic.LoadInt64(&c.activeIndex)
+                if idx >= 0 && idx < int64(len(c.links)) {
+                    link := c.links[idx]
                     atomic.AddInt64(&link.bytesRecvInWindow, int64(n))
                 }
             }
@@ -263,7 +263,8 @@ func (c *UdpClient) handleUpConnRead() {
 func (c *UdpClient) updateLinkTest(remoteAddr *net.UDPAddr, heartbeatID uint64, sendNano int64) {
     now := time.Now()
     for _, link := range c.links {
-        if link.RemoteAddr.IP.Equal(remoteAddr.IP) && link.RemoteAddr.Port == remoteAddr.Port {
+        currentAddr := link.remoteAddr.Load().(*net.UDPAddr)
+        if currentAddr.IP.Equal(remoteAddr.IP) && currentAddr.Port == remoteAddr.Port {
             link.mu.Lock()
 
             // 先判断这个heartbeatID是否在发送记录中
@@ -316,25 +317,32 @@ func (c *UdpClient) startDnsRefreshRoutine() {
         case <-c.stopChan:
             return
         case <-ticker.C:
+            c.mu_critical.Lock()
             c.refreshDns()
+            c.mu_critical.Unlock()
         }
     }
 }
 
 func (c *UdpClient) refreshDns() {
-    for _, link := range c.links {
-        addr, err := net.ResolveUDPAddr("udp", link.RemoteAddr.String())
+    activeIndex := atomic.LoadInt64(&c.activeIndex)
+    if activeIndex < 0 || activeIndex >= int64(len(c.links)) {
+        activeIndex = 0
+    }
+    for i, link := range c.links {
+        addr, err := net.ResolveUDPAddr("udp", link.OriginalAddr)
         if err != nil {
             log.Printf("[Client] 刷新 DNS 失败: %v", err)
             continue
         }
-
         link.mu.Lock()
-        link.RemoteAddr = addr
+        link.remoteAddr.Store(addr)
+        if int64(i) == activeIndex {
+            c.activeAddr.Store(addr)
+        }
         link.mu.Unlock()
-
         if c.config.Debug {
-            log.Printf("[Debug] DNS 刷新成功: %s -> %s", link.RemoteAddr.String(), addr.String())
+            log.Printf("[Debug] DNS 刷新成功: %s -> %s", link.OriginalAddr, addr.String())
         }
     }
 }
@@ -358,17 +366,17 @@ func (c *UdpClient) heartbeatRoutine() {
             if c.config.Debug {
                 log.Printf("[Debug] heartbeatRoutine")
             }
-            // 1) 发心跳
             c.sendHeartbeat()
             c.checkHeartbeatTimeout()
             tickCounter++
             if tickCounter >= 20 {
-                // 2) 选最佳线路
+                c.mu_critical.Lock()
                 c.selectBestLink()
-                // 3) 重置吞吐窗口
                 c.resetThroughputWindow()
+                c.mu_critical.Unlock()
                 // 重置计数器
                 tickCounter = 0
+                
             }
         }
     }
@@ -395,13 +403,14 @@ func (c *UdpClient) sendHeartbeat() {
         signedPkt := signPacket(c.clientPrivateKey, pkt)
         atomic.AddInt64(&link.testSent, 1)
         
-        _, err := c.upConn.WriteToUDP(signedPkt, link.RemoteAddr)
+        currentAddr := link.remoteAddr.Load().(*net.UDPAddr)
+        _, err := c.upConn.WriteToUDP(signedPkt, currentAddr)
         if err != nil {
             if ne, ok := err.(net.Error); ok && ne.Temporary() {
-                log.Printf("[Client] 心跳发送临时错误 -> %s: %v", link.RemoteAddr, err)
+                log.Printf("[Client] 心跳发送临时错误 -> %s: %v", currentAddr, err)
                 continue
             }
-            log.Printf("[Client] 心跳发送严重错误 -> %s: %v", link.RemoteAddr, err)
+            log.Printf("[Client] 心跳发送严重错误 -> %s: %v", currentAddr, err)
         }
     }
 }
@@ -425,11 +434,15 @@ func (c *UdpClient) checkHeartbeatTimeout() {
     }
 }
 func (c *UdpClient) selectBestLink() {
-    bestIdx := -1
+    bestIdx := int64(-1)
     bestScore := -math.MaxFloat64
 
     currIdx := atomic.LoadInt64(&c.activeIndex)
     currScore := -math.MaxFloat64
+
+    if (currIdx < 0) || (currIdx >= int64(len(c.links))) {
+        currIdx = 0
+    }
 
     // 累计所有链路的调试数据
     var debugData string
@@ -451,24 +464,20 @@ func (c *UdpClient) selectBestLink() {
             continue
         }
 
-        // 计算丢包率
-        if sent == 0 {
+        if (sent == 0) || (rttCount == 0) {
+            if c.config.Debug {
+                log.Printf("[Debug] %d 未收到足够的数据: sent=%d, rttCount=%d", i, sent, rttCount)
+            }
             continue
         }
+
         loss := float64(lost) / float64(sent)
-
-        // 计算 RTT
-        if rttCount == 0 {
-            continue
-        }
         rtt := float64(rttSum) / float64(rttCount)
-
-        // 根据 rtt 和 loss 算分，并减去优先级值
         score := CalcScore(ScoreData{RTT: rtt, LossRate: loss}, c.config.LossWeight, c.config.RttWeight) - link.Priority
 
         if score > bestScore {
             bestScore = score
-            bestIdx = i
+            bestIdx = int64(i)
         }
 
         if int64(i) == currIdx {
@@ -496,26 +505,19 @@ func (c *UdpClient) selectBestLink() {
     if bestIdx == -1 {
         // 所有线路都不可用
         log.Printf("[Client] 所有线路都不可用!")
-        return
-    }
-    // 若已是当前线路, 不切
-    if int64(bestIdx) == currIdx {
-        return
+        bestIdx = currIdx
     }
 
-    if (bestScore - currScore) < c.config.SwitchThreshold {
-        return
+    if (bestIdx == currIdx) || ((bestScore - currScore) < c.config.SwitchThreshold) || c.isCurrentLinkBusy(c.links[currIdx]) {
+        bestIdx = currIdx
+    } else {
+        log.Printf("[Client] 切换线路: %d -> %d (avgScore=%.2f)", currIdx, bestIdx, bestScore)
     }
-
-    if (currIdx >= 0) && (currIdx < int64(len(c.links))) {
-        if c.isCurrentLinkBusy(c.links[currIdx]) {
-            return
-        }
-    }
-
-    // 切换
-    log.Printf("[Client] 切换线路: %d -> %d (avgScore=%.2f)", currIdx, bestIdx, bestScore)
+    
     atomic.StoreInt64(&c.activeIndex, int64(bestIdx))
+
+    bestLinkAddr := c.links[bestIdx].remoteAddr.Load().(*net.UDPAddr)
+    c.activeAddr.Store(bestLinkAddr)
 }
 
 func (c *UdpClient) isCurrentLinkBusy(link *ClientLink) bool {
