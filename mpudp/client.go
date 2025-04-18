@@ -68,7 +68,11 @@ func NewUdpClient(cfg ClientConfig) (*UdpClient, error) {
     for _, linkCfg := range cfg.Links {
         addr, err := net.ResolveUDPAddr("udp", linkCfg.RemoteAddr)
         if err != nil {
-            return nil, fmt.Errorf("解析远程地址 [%s] 失败: %v", linkCfg.RemoteAddr, err)
+            log.Printf("[Client] 解析远程地址 [%s] 失败: %v，使用默认地址 127.0.0.1:34561", linkCfg.RemoteAddr, err)
+            addr = &net.UDPAddr{
+                IP:   net.ParseIP("127.0.0.1"),
+                Port: 34561,
+            }
         }
         link := &ClientLink{
             OriginalAddr:      linkCfg.RemoteAddr,
