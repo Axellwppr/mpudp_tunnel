@@ -182,8 +182,13 @@ func (c *UdpClient) handleListenRead() {
 
         activeAddr := c.activeAddr.Load().(*net.UDPAddr)
 
+        // 创建带有client ID的数据包
+        packetWithID := make([]byte, n+1)
+        packetWithID[0] = byte(c.config.ClientID) // 在包头添加client ID
+        copy(packetWithID[1:], buf[:n])
+
         // 发往远端(使用 upConn.WriteToUDP)
-        _, werr := c.upConn.WriteToUDP(buf[:n], activeAddr)
+        _, werr := c.upConn.WriteToUDP(packetWithID, activeAddr)
         if werr != nil {
             if ne, ok := werr.(net.Error); ok && ne.Temporary() {
                 log.Printf("[Client] 向远端发送临时错误: %v", werr)
@@ -225,8 +230,19 @@ func (c *UdpClient) handleUpConnRead() {
                 // 验签不通过，丢弃
                 continue
             }
-            sendNano := bytesToInt64(verifiedData[4:12])
-            heartbeatID := bytesToUint64(verifiedData[12:20])
+            
+            // 检查client ID是否匹配
+            if len(verifiedData) < 1 || int(verifiedData[0]) != c.config.ClientID {
+                // client ID不匹配，丢弃
+                continue
+            }
+            
+            // 提取时间戳和心跳ID（注意偏移量因为有client ID）
+            if len(verifiedData) < 17 {
+                continue
+            }
+            sendNano := bytesToInt64(verifiedData[5:13])  // 偏移+1因为client ID
+            heartbeatID := bytesToUint64(verifiedData[13:21]) // 偏移+1因为client ID
             
             // 检查时间戳,如果超过2秒就丢弃
             if time.Since(time.Unix(0, sendNano)) > 2*time.Second {
@@ -237,7 +253,7 @@ func (c *UdpClient) handleUpConnRead() {
             }
 
             c.updateLinkTest(remoteAddr, heartbeatID, sendNano)
-        }else{
+        } else {
             activeAddr := c.activeAddr.Load().(*net.UDPAddr)
             if activeAddr.IP.Equal(remoteAddr.IP) && activeAddr.Port == remoteAddr.Port {
                 // 统计下行流量
@@ -404,7 +420,12 @@ func (c *UdpClient) sendHeartbeat() {
             pkt = append(pkt, nonActiveMagic...)
         }
 
-        signedPkt := signPacket(c.clientPrivateKey, pkt)
+        // 为心跳包添加client ID
+        pktWithID := make([]byte, len(pkt)+1)
+        pktWithID[0] = byte(c.config.ClientID)
+        copy(pktWithID[1:], pkt)
+
+        signedPkt := signPacket(c.clientPrivateKey, pktWithID)
         atomic.AddInt64(&link.testSent, 1)
         
         currentAddr := link.remoteAddr.Load().(*net.UDPAddr)

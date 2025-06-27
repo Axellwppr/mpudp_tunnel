@@ -12,11 +12,14 @@ var nonActiveMagic = []byte{0x00}
 var activeMagic = []byte{0xFF}
 
 func isHeartbeatPacket(data []byte) bool {
-    if len(data) != ed25519.SignatureSize + 21 {
+    // 心跳包长度 = 签名(64) + client_id(1) + magic(4) + timestamp(8) + heartbeat_id(8) + active_flag(1) = 86字节
+    if len(data) != ed25519.SignatureSize + 22 {
         return false
     }
+    // 检查magic字节，现在位置偏移1字节（因为client ID）
+    magicOffset := ed25519.SignatureSize + 1
     for i := 0; i < 4; i++ {
-        if data[ed25519.SignatureSize + i] != heartbeatMagic[i] {
+        if data[magicOffset + i] != heartbeatMagic[i] {
             return false
         }
     }
@@ -67,8 +70,8 @@ func CalcScore(sd ScoreData, lossWeight, rttWeight float64) float64 {
 }
 
 
-// 服务端解析密钥
-func parseServerKeys(cfg ServerConfig) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+// 服务端解析密钥 - 修改为支持多个客户端
+func parseServerKeys(cfg ServerConfig) (ed25519.PrivateKey, []ed25519.PublicKey, error) {
     // 解码私钥
     skBytes, err := base64.StdEncoding.DecodeString(cfg.ServerPrivateKeyBase64)
     if err != nil {
@@ -79,17 +82,20 @@ func parseServerKeys(cfg ServerConfig) (ed25519.PrivateKey, ed25519.PublicKey, e
     }
     serverPrivateKey := ed25519.PrivateKey(skBytes)
 
-    // 解码公钥
-    pkBytes, err := base64.StdEncoding.DecodeString(cfg.ClientPublicKeyBase64)
-    if err != nil {
-        return nil, nil, fmt.Errorf("解码客户端公钥失败: %v", err)
+    // 解码多个客户端公钥
+    clientPublicKeys := make([]ed25519.PublicKey, len(cfg.ClientPublicKeysBase64))
+    for i, pkBase64 := range cfg.ClientPublicKeysBase64 {
+        pkBytes, err := base64.StdEncoding.DecodeString(pkBase64)
+        if err != nil {
+            return nil, nil, fmt.Errorf("解码客户端%d公钥失败: %v", i, err)
+        }
+        if len(pkBytes) != ed25519.PublicKeySize {
+            return nil, nil, fmt.Errorf("客户端%d公钥长度错误", i)
+        }
+        clientPublicKeys[i] = ed25519.PublicKey(pkBytes)
     }
-    if len(pkBytes) != ed25519.PublicKeySize {
-        return nil, nil, fmt.Errorf("客户端公钥长度错误") 
-    }
-    clientPublicKey := ed25519.PublicKey(pkBytes)
 
-    return serverPrivateKey, clientPublicKey, nil
+    return serverPrivateKey, clientPublicKeys, nil
 }
 
 // 客户端解析密钥

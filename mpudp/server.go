@@ -11,34 +11,50 @@ import (
     "github.com/cloudflare/circl/sign/ed25519"
 )
 
+type ClientState struct {
+    upConn            *net.UDPConn
+    lastDataAddr      *net.UDPAddr
+    lastHeartbeatTime time.Time
+    mu                sync.RWMutex
+}
 
 type UdpServer struct {
     config     ServerConfig
     listenConn *net.UDPConn
-    upConn     *net.UDPConn
+
+    // 每个客户端的状态
+    clientStates     []*ClientState
+    serverPrivateKey ed25519.PrivateKey
+    clientPublicKeys []ed25519.PublicKey
 
     stopChan chan struct{}
     wg       sync.WaitGroup
-
-    lastDataAddr      *net.UDPAddr
-    mu                sync.RWMutex
-    lastHeartbeatTime time.Time
-
-    serverPrivateKey ed25519.PrivateKey
-    clientPublicKey  ed25519.PublicKey
 }
 
 func NewUdpServer(cfg ServerConfig) (*UdpServer, error) {
-    serverPrivateKey, clientPublicKey, err := parseServerKeys(cfg)
+    serverPrivateKey, clientPublicKeys, err := parseServerKeys(cfg)
     if err != nil {
         return nil, fmt.Errorf("解析密钥失败: %v", err)
     }
 
+    // 验证配置的一致性
+    if len(cfg.UpstreamAddrs) != len(cfg.ClientPublicKeysBase64) {
+        return nil, fmt.Errorf("上游地址数量(%d)与客户端公钥数量(%d)不匹配", 
+            len(cfg.UpstreamAddrs), len(cfg.ClientPublicKeysBase64))
+    }
+
+    // 初始化客户端状态
+    clientStates := make([]*ClientState, len(cfg.UpstreamAddrs))
+    for i := range clientStates {
+        clientStates[i] = &ClientState{}
+    }
+
     return &UdpServer{
         config:           cfg,
+        clientStates:     clientStates,
         stopChan:         make(chan struct{}),
         serverPrivateKey: serverPrivateKey,
-        clientPublicKey:  clientPublicKey,
+        clientPublicKeys: clientPublicKeys,
     }, nil
 }
 
@@ -54,23 +70,28 @@ func (s *UdpServer) Start(ctx context.Context) error {
     }
     log.Printf("[Server] 已监听: %s", s.config.ListenAddr)
 
-    upAddr, err := net.ResolveUDPAddr("udp", s.config.UpstreamAddr)
-    if err != nil {
-        return fmt.Errorf("解析上游地址失败: %w", err)
+    // 为每个客户端建立上游连接
+    for i, upstreamAddr := range s.config.UpstreamAddrs {
+        upAddr, err := net.ResolveUDPAddr("udp", upstreamAddr)
+        if err != nil {
+            return fmt.Errorf("解析客户端%d上游地址失败: %w", i, err)
+        }
+        s.clientStates[i].upConn, err = net.DialUDP("udp", nil, upAddr)
+        if err != nil {
+            return fmt.Errorf("连接客户端%d上游失败: %w", i, err)
+        }
+        log.Printf("[Server] 客户端%d上游地址: %s", i, upstreamAddr)
     }
-    s.upConn, err = net.DialUDP("udp", nil, upAddr)
-    if err != nil {
-        return fmt.Errorf("连接上游失败: %w", err)
-    }
-    log.Printf("[Server] 上游地址: %s", s.config.UpstreamAddr)
 
     // 启动读客户端数据
     s.wg.Add(1)
     go s.handleClientRead()
 
-    // 启动读上游数据
-    s.wg.Add(1)
-    go s.handleUpServerRead()
+    // 为每个客户端启动读上游数据的goroutine
+    for i := range s.config.UpstreamAddrs {
+        s.wg.Add(1)
+        go s.handleUpServerRead(i)
+    }
 
     // 启动心跳超时检测
     s.wg.Add(1)
@@ -84,8 +105,10 @@ func (s *UdpServer) Stop() {
     if s.listenConn != nil {
         _ = s.listenConn.Close()
     }
-    if s.upConn != nil {
-        _ = s.upConn.Close()
+    for _, state := range s.clientStates {
+        if state.upConn != nil {
+            _ = state.upConn.Close()
+        }
     }
     s.wg.Wait()
 }
@@ -115,72 +138,127 @@ func (s *UdpServer) handleClientRead() {
             }
         }
 
-        if isHeartbeatPacket(buf[:n]){
-            // 仅对心跳包进行验签
-            verifiedData, ok := verifyPacket(s.clientPublicKey, buf[:n])
-            if !ok {
-                // 验签不通过，丢弃
-                continue
-            }
-
-            // 如果该心跳包为激活包，则更新客户端地址
-            if verifiedData[20] == activeMagic[0] {
-                s.mu.Lock()
-                s.lastHeartbeatTime = time.Now()
-                s.lastDataAddr = clientAddr
-                s.mu.Unlock()
-            }
-
-            // 回签名
-            signed := signPacket(s.serverPrivateKey, verifiedData)
-            _, _ = s.listenConn.WriteToUDP(signed, clientAddr)
+        if isHeartbeatPacket(buf[:n]) {
+            // 处理心跳包
+            s.handleHeartbeatPacket(buf[:n], clientAddr)
         } else {
-            // 直接把原始数据写给上游，不做签名
-            _, werr := s.upConn.Write(buf[:n])
-            if werr != nil {
-                if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                    log.Printf("[Server] 向上游发送临时错误: %v", werr)
-                    continue
-                }
-                log.Printf("[Server] 向上游发送严重错误: %v", werr)
-                os.Exit(1)
-            }
+            // 处理普通数据包
+            s.handleDataPacket(buf[:n], clientAddr)
         }
     }
 }
 
-func (s *UdpServer) handleUpServerRead() {
+func (s *UdpServer) handleHeartbeatPacket(data []byte, clientAddr *net.UDPAddr) {
+    // 先验证签名并提取数据
+    verifiedData, clientID, ok := s.verifyAndExtractClientData(data)
+    if !ok {
+        return
+    }
+
+    if clientID >= len(s.clientStates) {
+        log.Printf("[Server] 无效的客户端ID: %d", clientID)
+        return
+    }
+
+    // 检查激活标志（现在位置是verifiedData[20]，因为有client ID）
+    if len(verifiedData) > 20 && verifiedData[20] == activeMagic[0] {
+        state := s.clientStates[clientID]
+        state.mu.Lock()
+        state.lastHeartbeatTime = time.Now()
+        state.lastDataAddr = clientAddr
+        state.mu.Unlock()
+        log.Printf("[Server] 客户端%d心跳更新: %v", clientID, clientAddr)
+    }
+
+    // 回签名并发送响应
+    signed := signPacket(s.serverPrivateKey, verifiedData)
+    _, _ = s.listenConn.WriteToUDP(signed, clientAddr)
+}
+
+func (s *UdpServer) handleDataPacket(data []byte, clientAddr *net.UDPAddr) {
+    if len(data) < 1 {
+        return
+    }
+
+    clientID := int(data[0])
+    if clientID >= len(s.clientStates) {
+        log.Printf("[Server] 数据包包含无效的客户端ID: %d", clientID)
+        return
+    }
+
+    // 提取实际数据（去掉client ID）
+    actualData := data[1:]
+    
+    // 发送到对应的上游
+    state := s.clientStates[clientID]
+    _, werr := state.upConn.Write(actualData)
+    if werr != nil {
+        if ne, ok := werr.(net.Error); ok && ne.Temporary() {
+            log.Printf("[Server] 向客户端%d上游发送临时错误: %v", clientID, werr)
+            return
+        }
+        log.Printf("[Server] 向客户端%d上游发送严重错误: %v", clientID, werr)
+        os.Exit(1)
+    }
+}
+
+func (s *UdpServer) verifyAndExtractClientData(data []byte) ([]byte, int, bool) {
+    if len(data) < ed25519.SignatureSize + 1 {
+        return nil, 0, false
+    }
+
+    sig := data[:ed25519.SignatureSize]
+    signedData := data[ed25519.SignatureSize:]
+    
+    if len(signedData) < 1 {
+        return nil, 0, false
+    }
+
+    clientID := int(signedData[0])
+    if clientID >= len(s.clientPublicKeys) {
+        return nil, 0, false
+    }
+
+    // 验证签名
+    if ed25519.Verify(s.clientPublicKeys[clientID], signedData, sig) {
+        return signedData, clientID, true
+    }
+    return nil, 0, false
+}
+
+func (s *UdpServer) handleUpServerRead(clientID int) {
     defer s.wg.Done()
     buf := make([]byte, 64*1024)
+    state := s.clientStates[clientID]
 
     for {
-        n, err := s.upConn.Read(buf)
+        n, err := state.upConn.Read(buf)
         if err != nil {
             select {
             case <-s.stopChan:
                 return
             default:
                 if ne, ok := err.(net.Error); ok && ne.Temporary() {
-                    log.Printf("[Server] 读取上游临时错误: %v", err)
+                    log.Printf("[Server] 读取客户端%d上游临时错误: %v", clientID, err)
                     continue
                 }
-                log.Printf("[Server] 读取上游严重错误: %v", err)
+                log.Printf("[Server] 读取客户端%d上游严重错误: %v", clientID, err)
                 os.Exit(1)
             }
         }
 
-        s.mu.RLock()
-        addr := s.lastDataAddr
-        s.mu.RUnlock()
+        state.mu.RLock()
+        addr := state.lastDataAddr
+        state.mu.RUnlock()
 
         if addr != nil {
             _, werr := s.listenConn.WriteToUDP(buf[:n], addr)
             if werr != nil {
                 if ne, ok := werr.(net.Error); ok && ne.Temporary() {
-                    log.Printf("[Server] 回写客户端临时错误: %v", werr)
+                    log.Printf("[Server] 回写客户端%d临时错误: %v", clientID, werr)
                     continue
                 }
-                log.Printf("[Server] 回写客户端严重错误: %v", werr)
+                log.Printf("[Server] 回写客户端%d严重错误: %v", clientID, werr)
                 os.Exit(1)
             }
         }
@@ -200,17 +278,19 @@ func (s *UdpServer) heartbeatTimeoutChecker() {
         case <-s.stopChan:
             return
         case <-ticker.C:
-            s.mu.RLock()
-            last := s.lastHeartbeatTime
-            s.mu.RUnlock()
+            for i, state := range s.clientStates {
+                state.mu.RLock()
+                last := state.lastHeartbeatTime
+                state.mu.RUnlock()
 
-            if time.Since(last) > timeout {
-                s.mu.Lock()
-                if s.lastDataAddr != nil {
-                    log.Printf("[Server] 心跳超时，清理客户端地址: %v", s.lastDataAddr)
+                if time.Since(last) > timeout {
+                    state.mu.Lock()
+                    if state.lastDataAddr != nil {
+                        log.Printf("[Server] 客户端%d心跳超时，清理地址: %v", i, state.lastDataAddr)
+                    }
+                    state.lastDataAddr = nil
+                    state.mu.Unlock()
                 }
-                s.lastDataAddr = nil
-                s.mu.Unlock()
             }
         }
     }

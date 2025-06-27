@@ -34,8 +34,8 @@ func main() {
         if err := srv.Start(ctx); err != nil {
             log.Fatalf("服务器启动失败: %v", err)
         }
-        log.Printf("[Server] 服务器启动完毕 (listen=%s, upstream=%s)",
-            cfg.Server.ListenAddr, cfg.Server.UpstreamAddr)
+        log.Printf("[Server] 服务器启动完毕 (listen=%s)",
+            cfg.Server.ListenAddr)
         select {}
     } else if cfg.Mode == "client" {
         cli, err := NewUdpClient(cfg.Client)

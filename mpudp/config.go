@@ -7,15 +7,16 @@ type Config struct {
 }
 
 type ServerConfig struct {
-    ListenAddr          string `json:"listen_addr"`
-    UpstreamAddr        string `json:"upstream_addr"`
-    HeartbeatTimeoutSec int    `json:"heartbeat_timeout_sec"`
-    ServerPrivateKeyBase64 string `json:"server_private_key"`
-    ClientPublicKeyBase64  string `json:"client_public_key"` 
-    MaxPacketSize         int    `json:"max_packet_size"`
+    ListenAddr              string   `json:"listen_addr"`
+    UpstreamAddrs           []string `json:"upstream_addrs"`           // 改为数组，支持多个上游地址
+    HeartbeatTimeoutSec     int      `json:"heartbeat_timeout_sec"`
+    ServerPrivateKeyBase64  string   `json:"server_private_key"`
+    ClientPublicKeysBase64  []string `json:"client_public_keys"`       // 改为数组，支持多个客户端公钥
+    MaxPacketSize           int      `json:"max_packet_size"`
 }
 
 type ClientConfig struct {
+    ClientID                int          `json:"client_id"`               // 新增：客户端ID
     ListenAddr              string       `json:"listen_addr"`
     Links                   []LinkConfig `json:"links"`
     HeartbeatIntervalSec    float64      `json:"heartbeat_interval_sec"`
@@ -25,7 +26,7 @@ type ClientConfig struct {
     ThroughputThresholdKbps float64      `json:"throughput_threshold_kbps"`
     MaxConsecutiveFail      int          `json:"max_consecutive_fail"`
     DnsRefreshIntervalSec   int          `json:"dns_refresh_interval_sec"`
-    Debug                   bool          `json:"debug"`
+    Debug                   bool         `json:"debug"`
     ClientPrivateKeyBase64  string       `json:"client_private_key"`
     ServerPublicKeyBase64   string       `json:"server_public_key"`
     MaxPacketSize           int          `json:"max_packet_size"`
