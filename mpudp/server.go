@@ -160,8 +160,8 @@ func (s *UdpServer) handleHeartbeatPacket(data []byte, clientAddr *net.UDPAddr) 
         return
     }
 
-    // 检查激活标志（现在位置是verifiedData[20]，因为有client ID）
-    if len(verifiedData) > 20 && verifiedData[20] == activeMagic[0] {
+    // 检查激活标志（现在位置是verifiedData[21]，因为有client ID）
+    if len(verifiedData) > 21 && verifiedData[21] == activeMagic[0] {
         state := s.clientStates[clientID]
         state.mu.Lock()
         state.lastHeartbeatTime = time.Now()
